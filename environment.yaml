@@ -1,0 +1,42 @@
+name: dsgen
+channels:
+  - pytorch
+  - defaults
+  - nvidia
+dependencies:
+  - python=3.10
+  - pip=24.0
+  - setuptools=69.5.1
+  - pytorch=2.3.1
+  - torchvision=0.18.1
+  - pytorch-cuda=12.1
+  # Use the defaults-channel MKL build predating the iJIT_NotifyEvent ABI break.
+  - mkl=2023.1.0
+  - numpy=1.26.4
+  # Keep the interpolation and Pillow APIs used by the bundled data loaders.
+  - scipy=1.11.4
+  - pillow
+  - pip:
+    - albumentations==1.3.1
+    - diffusers==0.29.2
+    # Use one cv2 distribution; invisible-watermark is unused and requires the GUI build.
+    - opencv-python-headless==4.10.0.84
+    - pudb==2024.1
+    - imageio==2.34.1
+    - imageio-ffmpeg==0.5.1
+    - pytorch-lightning==2.3.3
+    - omegaconf==2.3.0
+    - tensorboard==2.17.0
+    - streamlit==1.36.0
+    - einops==0.3.0
+    - torch-fidelity==0.3.0
+    - transformers==4.41.2
+    - huggingface-hub==0.23.4
+    - torchmetrics==1.4.0
+    - kornia==0.6.0
+    - matplotlib==3.8.4
+    - natsort==8.4.0
+    - academictorrents==2.3.3
+    - safetensors==0.4.3
+    - -e ./src/taming-transformers
+    - -e ./src/clip
