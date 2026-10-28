@@ -20,6 +20,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.attention_dual import SpatialTransformer
+from bldm.instance_attention import InstanceAttention
 from bldm.mask_attention import MaskCrossAttention
 
 
@@ -718,7 +719,7 @@ class UNetModel(nn.Module):
 
     #x=x_noisy, timesteps=t, context=control,mask_control=mask_control,masks=mask_vector
 
-    def forward(self, x, timesteps=None, context=None, control=None, category_control=None, mask_control=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, control=None, category_control=None, mask_control=None, y=None, mask_vector=None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -736,6 +737,10 @@ class UNetModel(nn.Module):
 
         # add noise mask
         mask = th.max(mask_control[0], dim=1).values
+        mode = getattr(self, 'instance_attn', 'baseline')
+        if mode != 'baseline':
+            mask = InstanceAttention(mask_control[0], mask_vector, mode,
+                                     getattr(self, 'instance_self_resolutions', (16, 32)))
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)

@@ -6,6 +6,7 @@ from torch import nn, einsum
 from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint
+from bldm.instance_attention import InstanceAttention
 
 
 def exists(val):
@@ -169,7 +170,7 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, control=None, mask=None, lambda_=1):
+    def forward(self, x, context=None, control=None, mask=None, lambda_=1, object_mask=None, self_mask=None):
         h = self.heads
 
         q = self.to_q(x)
@@ -180,6 +181,10 @@ class CrossAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+
+        if self_mask is not None:
+            allowed = repeat(self_mask, 'b i j -> (b h) i j', h=h)
+            sim = sim.masked_fill(~allowed, max_neg_value(sim))
 
         if exists(mask):
             k_control = self.to_k_control(control)
@@ -194,7 +199,12 @@ class CrossAttention(nn.Module):
             # mask = repeat(mask, 'b j -> (b h) () j', h=h)
             # sim_control.masked_fill_(~mask, max_neg_value)
 
+            if object_mask is not None:
+                allowed = repeat(object_mask, 'b i j -> (b h) i j', h=h)
+                sim_control = sim_control.masked_fill(~allowed, max_neg_value(sim_control))
             attn_control = sim_control.softmax(dim=-1)
+            if object_mask is not None:
+                attn_control = attn_control * allowed
             out_control = einsum('b i j, b j d -> b i d', attn_control, v_control)
             out_control = rearrange(out_control, '(b h) n d -> b n (h d)', h=h)
 
@@ -263,12 +273,12 @@ class BasicTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None, control=None, mask=None):
-        return checkpoint(self._forward, (x, context, control, mask), self.parameters(), self.checkpoint)
+    def forward(self, x, context=None, control=None, mask=None, object_mask=None, self_mask=None):
+        return checkpoint(self._forward, (x, context, control, mask, object_mask, self_mask), self.parameters(), self.checkpoint)
 
-    def _forward(self, x, context=None, control=None, mask=None):
-        x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context, control=control, mask=mask) + x
+    def _forward(self, x, context=None, control=None, mask=None, object_mask=None, self_mask=None):
+        x = self.attn1(self.norm1(x), self_mask=self_mask) + x
+        x = self.attn2(self.norm2(x), context=context, control=control, mask=mask, object_mask=object_mask) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -311,8 +321,12 @@ class SpatialTransformer(nn.Module):
         x = self.norm(x)
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
+        object_mask = self_mask = None
+        if isinstance(mask, InstanceAttention):
+            object_mask, self_mask = mask.for_resolution(h, w)
+            mask = object_mask
         for block in self.transformer_blocks:
-            x = block(x, context=context, control=control, mask=mask)
+            x = block(x, context=context, control=control, mask=mask, object_mask=object_mask, self_mask=self_mask)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in

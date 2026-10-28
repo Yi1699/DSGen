@@ -1,103 +1,152 @@
-# support COCO txt file
-
-import sys
-if './' not in sys.path:
-    sys.path.append('./')
-import os
-import torch
+"""AeroGen inference and fixed-noise instance-attention ablations."""
+import argparse
+import csv
+import hashlib
+import json
 import random
+import sys
+import time
+from contextlib import nullcontext
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import numpy as np
-from PIL import Image
-import einops
-from tqdm import tqdm
+import torch
+from PIL import Image, ImageDraw
 from omegaconf import OmegaConf
-from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-from src.datasets.dataset_display import MyDataset
 from torch.utils.data import DataLoader
 
-original_path = 'demo/txt'
-ckpt_file_path = './ckpt/aerogen_diorr_last.ckpt'
-resolution = 512
-mask_size = 64
-mode = 'test'
-batch_size = 1
-num_samples = 2
-ddim_steps = 50
-H = 512
-W = 512
+from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.util import instantiate_from_config
+from src.datasets.dataset_display import MyDataset
 
-dataset = MyDataset(original_path, resolution, mask_size)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=32)
+MODES = ("baseline", "padding", "cross", "self", "both")
 
-def get_state_dict(d):
-    return d.get('state_dict', d)
 
-def load_state_dict(ckpt_path, location='cpu'):
-    _, extension = os.path.splitext(ckpt_path)
-    if extension.lower() == ".safetensors":
-        import safetensors.torch
-        state_dict = safetensors.torch.load_file(ckpt_path, device=location)
-    else:
-        state_dict = get_state_dict(torch.load(ckpt_path, map_location=torch.device(location)))
-    state_dict = get_state_dict(state_dict)
-    print(f'Loaded state_dict from [{ckpt_path}]')
-    return state_dict
+def load_state_dict(path):
+    if Path(path).suffix == ".safetensors":
+        from safetensors.torch import load_file
+        return load_file(path, device="cpu")
+    checkpoint = torch.load(path, map_location="cpu", mmap=True)
+    return checkpoint.get("state_dict", checkpoint)
+
 
 def create_model(config_path):
-    config = OmegaConf.load(config_path)
-    model = instantiate_from_config(config.model).cpu()
-    print(f'Loaded model config from [{config_path}]')
-    return model
-
-model = create_model('configs/stable-diffusion/dual/v1-finetune-DIOR-R.yaml').cuda()
-model.load_state_dict(load_state_dict(ckpt_file_path, location='cpu'))
-model = model.cuda()
-ddim_sampler = DDIMSampler(model)
-
-for batch in tqdm(dataloader):
-    filenames = batch['filename']
-    prompts = batch['txt']
-    
-    with torch.no_grad():
-        mask_controls = batch['mask_conditions'].float().cuda()
-        category_controls = batch['category_conditions'].float().cuda()
-        bbox_controls = batch['bboxes'].float().cuda()
-        mask_vectors = batch['mask_vector'].float().cuda()
-        cond = {
-            "c_crossattn": [model.get_learned_conditioning(prompts * num_samples)],
-            "bbox_control": [torch.cat([bbox_controls for _ in range(num_samples)], dim=0)],
-            "category_control": [torch.cat([category_controls for _ in range(num_samples)], dim=0)],
-            "mask_control": [torch.cat([mask_controls for _ in range(num_samples)], dim=0)],
-            "mask_vector": [torch.cat([mask_vectors for _ in range(num_samples)], dim=0)],
-        }
-        un_cond = {
-            "c_crossattn": [model.get_learned_conditioning([""] * num_samples * batch_size)],
-            "bbox_control": [torch.cat([bbox_controls for _ in range(num_samples)], dim=0)],
-            "category_control": [torch.cat([category_controls for _ in range(num_samples)], dim=0)],
-            "mask_control": [torch.cat([mask_controls for _ in range(num_samples)], dim=0)],
-            "mask_vector": [torch.cat([mask_vectors for _ in range(num_samples)], dim=0)],
-        }
-
-        shape = (4, H // 8, W // 8)
-        samples, _ = ddim_sampler.sample(ddim_steps, num_samples * batch_size, shape, cond, verbose=False, eta=0.2,
-                                         unconditional_guidance_scale=7.5,
-                                         unconditional_conditioning=un_cond)
+    return instantiate_from_config(OmegaConf.load(config_path).model)
 
 
-    x_samples = model.decode_first_stage(samples)
-    x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+def comparison(images, boxes, labels, output):
+    canvas = Image.new("RGB", (512 * len(images), 542), "white")
+    draw = ImageDraw.Draw(canvas)
+    for column, (label, image) in enumerate(zip(labels, images)):
+        image = image.copy()
+        overlay = ImageDraw.Draw(image)
+        for index, box in enumerate(boxes):
+            points = [(int(x * 8), int(y * 8)) for x, y in box.reshape(4, 2)]
+            overlay.line(points + points[:1], fill="#ff5555", width=2)
+            overlay.text(points[0], str(index + 1), fill="yellow", stroke_width=1, stroke_fill="black")
+        canvas.paste(image, (512 * column, 30))
+        draw.text((512 * column + 10, 8), label, fill="black")
+    canvas.save(output)
 
-    for i, filename in enumerate(filenames):
-        results = [x_samples[i * num_samples + j] for j in range(num_samples)]
-        
-        for idx, image_data in enumerate(results):
-            output_dir = os.path.join('./demo/img', str(idx))
-            os.makedirs(output_dir, exist_ok=True)
-            
-            image = Image.fromarray(image_data)
-            output_file = os.path.join(output_dir, filename.replace('txt', 'jpg'))
-            image.save(output_file)
-            
-            print(f'Generation images saved at {output_file}')
-            print('ok')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--instance_attn", choices=MODES, nargs="+", default=["baseline"])
+    parser.add_argument("--input_dir", default="demo/txt")
+    parser.add_argument("--output_dir", default="outputs/exp1")
+    parser.add_argument("--config", default="configs/stable-diffusion/dual/v1-finetune-DIOR-R.yaml")
+    parser.add_argument("--ckpt", default="ckpt/aerogen_diorr_last.ckpt")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--num_samples", type=int, default=2)
+    parser.add_argument("--eta", type=float, default=0.2)
+    parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument("--self_resolutions", type=int, nargs="+", default=[16, 32])
+    parser.add_argument("--precision", choices=("full", "autocast"), default="full")
+    parser.add_argument("--limit", type=int)
+    return parser.parse_args()
+
+
+@torch.inference_mode()
+def main():
+    args = parse_args()
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    (output/"comparisons").mkdir(exist_ok=True)
+    (output/"run.json").write_text(json.dumps(vars(args), indent=2))
+    dataset = MyDataset(args.input_dir, 512, 64)
+    dataset.files.sort()
+    if args.limit is not None:
+        dataset.files = dataset.files[:args.limit]
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    torch.manual_seed(args.seed)
+    model = create_model(args.config).cuda().eval()
+    state = load_state_dict(args.ckpt)
+    model.load_state_dict(state, strict=True)
+    del state
+    print("Loaded checkpoint (strict=True)", flush=True)
+    sampler = DDIMSampler(model)
+    unet = model.model.diffusion_model
+    unet.instance_self_resolutions = tuple(args.self_resolutions)
+    precision = torch.autocast("cuda") if args.precision == "autocast" else nullcontext()
+    rows = []
+    for index, batch in enumerate(loader):
+        stem = Path(batch["filename"][0]).stem
+        seed = args.seed + index
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        controls = {target: [batch[source].float().cuda().repeat_interleave(args.num_samples, 0)]
+                    for target, source in (("bbox_control", "bboxes"),
+                                           ("category_control", "category_conditions"),
+                                           ("mask_control", "mask_conditions"),
+                                           ("mask_vector", "mask_vector"))}
+        with precision:
+            cond = dict(controls, c_crossattn=[model.get_learned_conditioning(batch["txt"] * args.num_samples)])
+            uncond = dict(controls, c_crossattn=[model.get_learned_conditioning([""] * args.num_samples)])
+        noise = torch.randn((args.num_samples, 4, 64, 64), device="cuda")
+        noise_hash = hashlib.sha256(noise.cpu().numpy().tobytes()).hexdigest()
+        rng_state = torch.cuda.get_rng_state()
+        results = {}
+        for mode in args.instance_attn:
+            unet.instance_attn = mode
+            torch.cuda.set_rng_state(rng_state)
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            with precision:
+                samples, _ = sampler.sample(args.steps, args.num_samples, (4, 64, 64), cond,
+                                            verbose=False, eta=args.eta, x_T=noise.clone(),
+                                            unconditional_guidance_scale=args.guidance_scale,
+                                            unconditional_conditioning=uncond)
+                decoded = model.decode_first_stage(samples)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - started
+            assert torch.isfinite(decoded).all(), (stem, mode)
+            pixels = ((decoded.permute(0, 2, 3, 1).float() * 127.5 + 127.5)
+                      .cpu().numpy().clip(0, 255).astype(np.uint8))
+            results[mode] = [Image.fromarray(image) for image in pixels]
+            folder = output/mode
+            folder.mkdir(exist_ok=True)
+            for sample, image in enumerate(results[mode]):
+                image.save(folder/f"{stem}_{sample}.png")
+                rows.append(dict(layout=stem, mode=mode, sample=sample, seed=seed,
+                                 instances=int(batch["mask_vector"].sum()), seconds=round(elapsed, 3),
+                                 noise_sha256=noise_hash))
+            print(f"{index+1}/{len(dataset)} {stem} {mode}: {elapsed:.2f}s", flush=True)
+        boxes = batch["bboxes"][0][batch["mask_vector"][0].bool()].numpy()
+        for sample in range(args.num_samples):
+            images = [Image.new("RGB", (512, 512), "#303030")]
+            images += [results[mode][sample] for mode in args.instance_attn]
+            comparison(images, boxes, [stem] + args.instance_attn,
+                       output/"comparisons"/f"{stem}_{sample}.jpg")
+        with (output/"stats.csv").open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    print(f"Saved {len(rows)} images and comparisons to {output}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

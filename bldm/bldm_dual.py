@@ -82,7 +82,7 @@ class BLDM(LatentDiffusion):
         control = self.condition_tokenizer(text_embeddings=category_control,masks=mask_vector,boxes=bbox_control)
         # no cut
         # cond_txt=torch.cat((cond_txt,control),dim=1)
-        eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, category_control=category_control, mask_control=mask_control
+        eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, category_control=category_control, mask_control=mask_control, mask_vector=mask_vector[0]
                             )
         # print(eps.shape)
         
